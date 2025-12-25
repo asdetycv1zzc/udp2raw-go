@@ -8,7 +8,11 @@ When used alone,udp2raw tunnels only UDP traffic. Nevertheless,if you used udp2r
 
 ## Go rewrite
 
-This repository now contains a Go implementation (`cmd/udp2raw`) that mirrors the legacy CLI layout while relying on Go's standard networking, AES, and HMAC primitives. The Go version keeps the key/password derivation behavior from the original (PBKDF2 + HKDF) so that existing keys still work, but currently transports packets over UDP for all `--raw-mode` settings. FakeTCP/ICMP header simulation is planned but not yet implemented.
+This repository now contains a Go implementation (`cmd/udp2raw`) that mirrors the legacy CLI layout while relying on Go's standard networking, AES, and HMAC primitives. The Go version keeps the key/password derivation behavior from the original (PBKDF2 + HKDF) so that existing keys still work. Raw modes are mapped as follows:
+
+* `--raw-mode udp`: UDP encapsulation (default)
+* `--raw-mode icmp`: ICMP echo encapsulation using raw ICMP sockets
+* `--raw-mode faketcp`/`easy-faketcp`: TCP-framed encapsulation (length-prefixed stream) to ease traversal of strict UDP/ICMP filters
 
 ### Build
 

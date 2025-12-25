@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -127,9 +128,9 @@ func runClient(cfg *cfgpkg.Config, session *Session, logger *log.Logger) error {
 	}
 	defer localUDP.Close()
 
-	transportConn, err := net.DialUDP("udp", nil, mustResolve(cfg.Remote))
+	transportConn, remoteAddr, err := newClientTransport(cfg.RawMode, cfg.Local, cfg.Remote)
 	if err != nil {
-		return fmt.Errorf("dial server: %w", err)
+		return fmt.Errorf("create client transport: %w", err)
 	}
 	defer transportConn.Close()
 
@@ -138,13 +139,13 @@ func runClient(cfg *cfgpkg.Config, session *Session, logger *log.Logger) error {
 	addrToID := make(map[string]uint32)
 	addrMu := sync.Mutex{}
 
-	go sendHeartbeats(session, transportConn, logger, 0)
+	go sendHeartbeatsPacket(session, transportConn, logger, 0, remoteAddr)
 
 	// receive from transport -> forward to local app
 	go func() {
 		buf := make([]byte, 64*1024)
 		for {
-			n, err := transportConn.Read(buf)
+			n, addr, err := transportConn.ReadFrom(buf)
 			if err != nil {
 				logger.Printf("transport read error: %v", err)
 				return
@@ -159,7 +160,7 @@ func runClient(cfg *cfgpkg.Config, session *Session, logger *log.Logger) error {
 			}
 			flow, ok := flows.Get(frame.FlowID)
 			if !ok {
-				logger.Printf("unknown flow %d from server", frame.FlowID)
+				logger.Printf("unknown flow %d from server %v", frame.FlowID, addr)
 				continue
 			}
 			flows.Touch(flow.ID)
@@ -195,19 +196,13 @@ func runClient(cfg *cfgpkg.Config, session *Session, logger *log.Logger) error {
 			logger.Printf("marshal frame error: %v", err)
 			continue
 		}
-		if _, err := transportConn.Write(cipherText); err != nil {
+		if _, err := transportConn.WriteTo(cipherText, remoteAddr); err != nil {
 			logger.Printf("send frame error: %v", err)
 		}
 	}
 }
 
 func runServer(cfg *cfgpkg.Config, session *Session, logger *log.Logger) error {
-	transportConn, err := net.ListenPacket("udp", cfg.Local)
-	if err != nil {
-		return fmt.Errorf("listen transport: %w", err)
-	}
-	defer transportConn.Close()
-
 	backendAddr := mustResolve(cfg.Remote)
 	flows := NewFlowTable()
 
@@ -218,11 +213,42 @@ func runServer(cfg *cfgpkg.Config, session *Session, logger *log.Logger) error {
 		}
 	}()
 
-	buf := make([]byte, 64*1024)
+	switch strings.ToLower(cfg.RawMode) {
+	case "faketcp", "easy-faketcp":
+		return serveTCP(cfg, session, logger, flows, backendAddr)
+	case "icmp":
+		return servePacket(cfg, session, logger, flows, backendAddr, "icmp")
+	case "udp":
+		return servePacket(cfg, session, logger, flows, backendAddr, "udp")
+	default:
+		return fmt.Errorf("unsupported raw-mode %s", cfg.RawMode)
+	}
+}
+
+func serveTCP(cfg *cfgpkg.Config, session *Session, logger *log.Logger, flows *FlowTable, backendAddr *net.UDPAddr) error {
+	ln, err := newTCPListener(cfg.Local)
+	if err != nil {
+		return fmt.Errorf("listen tcp: %w", err)
+	}
+	defer ln.Close()
+
 	for {
-		n, addr, err := transportConn.ReadFrom(buf)
+		t, err := ln.AcceptTransport()
 		if err != nil {
 			return err
+		}
+		go handleTCPConn(t, session, logger, flows, backendAddr)
+	}
+}
+
+func handleTCPConn(tp *tcpFramedTransport, session *Session, logger *log.Logger, flows *FlowTable, backendAddr *net.UDPAddr) {
+	defer tp.Close()
+	buf := make([]byte, 64*1024)
+	for {
+		n, addr, err := tp.ReadFrom(buf)
+		if err != nil {
+			logger.Printf("tcp transport read error: %v", err)
+			return
 		}
 		frame, err := session.UnmarshalFrame(buf[:n])
 		if err != nil {
@@ -231,10 +257,9 @@ func runServer(cfg *cfgpkg.Config, session *Session, logger *log.Logger) error {
 		}
 		udpAddr, _ := net.ResolveUDPAddr("udp", addr.String())
 		if frame.Flags&flagHeartbeat != 0 {
-			// send heartbeat ack
 			reply, err := session.MarshalFrame(Frame{Seq: frame.Seq, FlowID: frame.FlowID, Flags: flagHeartbeat})
 			if err == nil {
-				_, _ = transportConn.WriteTo(reply, addr)
+				_, _ = tp.WriteTo(reply, addr)
 			}
 			continue
 		}
@@ -246,8 +271,7 @@ func runServer(cfg *cfgpkg.Config, session *Session, logger *log.Logger) error {
 				continue
 			}
 			flow = flows.Add(udpAddr, backend, frame.FlowID)
-			// start reader for backend
-			go pumpBackend(flow, session, transportConn, logger)
+			go pumpBackend(flow, session, tp, logger, addr)
 		}
 		flows.Touch(flow.ID)
 		if len(frame.Payload) == 0 {
@@ -259,7 +283,59 @@ func runServer(cfg *cfgpkg.Config, session *Session, logger *log.Logger) error {
 	}
 }
 
-func pumpBackend(flow *Flow, session *Session, transport net.PacketConn, logger *log.Logger) {
+func servePacket(cfg *cfgpkg.Config, session *Session, logger *log.Logger, flows *FlowTable, backendAddr *net.UDPAddr, mode string) error {
+	var transport packetTransport
+	var err error
+	if mode == "icmp" {
+		transport, err = newServerICMPTransport(cfg.Local)
+	} else {
+		transport, err = newServerUDPTransport(cfg.Local)
+	}
+	if err != nil {
+		return fmt.Errorf("listen transport: %w", err)
+	}
+	defer transport.Close()
+
+	buf := make([]byte, 64*1024)
+	for {
+		n, addr, err := transport.ReadFrom(buf)
+		if err != nil {
+			return err
+		}
+		frame, err := session.UnmarshalFrame(buf[:n])
+		if err != nil {
+			logger.Printf("frame decode error: %v", err)
+			continue
+		}
+		udpAddr, _ := net.ResolveUDPAddr("udp", addr.String())
+		if frame.Flags&flagHeartbeat != 0 {
+			reply, err := session.MarshalFrame(Frame{Seq: frame.Seq, FlowID: frame.FlowID, Flags: flagHeartbeat})
+			if err == nil {
+				_, _ = transport.WriteTo(reply, addr)
+			}
+			continue
+		}
+		flow, ok := flows.Get(frame.FlowID)
+		if !ok {
+			backend, err := net.DialUDP("udp", nil, backendAddr)
+			if err != nil {
+				logger.Printf("dial backend failed: %v", err)
+				continue
+			}
+			flow = flows.Add(udpAddr, backend, frame.FlowID)
+			go pumpBackend(flow, session, transport, logger, addr)
+		}
+		flows.Touch(flow.ID)
+		if len(frame.Payload) == 0 {
+			continue
+		}
+		if _, err := flow.Backend.Write(frame.Payload); err != nil {
+			logger.Printf("write to backend failed: %v", err)
+		}
+	}
+}
+
+func pumpBackend(flow *Flow, session *Session, transport packetTransport, logger *log.Logger, remote net.Addr) {
 	buf := make([]byte, 64*1024)
 	for {
 		n, err := flow.Backend.Read(buf)
@@ -272,13 +348,13 @@ func pumpBackend(flow *Flow, session *Session, transport net.PacketConn, logger 
 			logger.Printf("marshal frame error: %v", err)
 			continue
 		}
-		if _, err := transport.WriteTo(cipherText, flow.PeerAddr); err != nil {
+		if _, err := transport.WriteTo(cipherText, remote); err != nil {
 			logger.Printf("send to client failed: %v", err)
 		}
 	}
 }
 
-func sendHeartbeats(session *Session, conn net.Conn, logger *log.Logger, flowID uint32) {
+func sendHeartbeatsPacket(session *Session, transport packetTransport, logger *log.Logger, flowID uint32, remote net.Addr) {
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
 	for range ticker.C {
@@ -288,7 +364,7 @@ func sendHeartbeats(session *Session, conn net.Conn, logger *log.Logger, flowID 
 			logger.Printf("heartbeat marshal failed: %v", err)
 			continue
 		}
-		if _, err := conn.Write(data); err != nil {
+		if _, err := transport.WriteTo(data, remote); err != nil {
 			logger.Printf("heartbeat send failed: %v", err)
 			return
 		}
