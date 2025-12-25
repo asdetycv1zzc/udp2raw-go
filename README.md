@@ -6,6 +6,33 @@ A Tunnel which turns UDP Traffic into Encrypted FakeTCP/UDP/ICMP Traffic by usin
 When used alone,udp2raw tunnels only UDP traffic. Nevertheless,if you used udp2raw + any UDP-based VPN together,you can tunnel any traffic(include TCP/UDP/ICMP),currently OpenVPN/L2TP/ShadowVPN and [tinyfecVPN](https://github.com/wangyu-/tinyfecVPN) are confirmed to be supported.
 
 
+## Go rewrite
+
+This repository now contains a Go implementation (`cmd/udp2raw`) that mirrors the legacy CLI layout while relying on Go's standard networking, AES, and HMAC primitives. The Go version keeps the key/password derivation behavior from the original (PBKDF2 + HKDF) so that existing keys still work, but currently transports packets over UDP for all `--raw-mode` settings. FakeTCP/ICMP header simulation is planned but not yet implemented.
+
+### Build
+
+```bash
+go build ./cmd/udp2raw
+```
+
+### Quick start
+
+Server:
+
+```bash
+./udp2raw -s -l 0.0.0.0:4096 -r 127.0.0.1:7777 -k "passwd" --raw-mode udp
+```
+
+Client:
+
+```bash
+./udp2raw -c -l 0.0.0.0:3333 -r 44.55.66.77:4096 -k "passwd" --raw-mode udp
+```
+
+Traffic sent to `-l` on the client is forwarded to the server's `-r` destination. The Go server maps flows dynamically and returns responses to the correct local UDP source on the client. Heartbeats are exchanged automatically to keep NAT bindings alive.
+
+
 ![image0](images/image0.PNG)
 
 or
