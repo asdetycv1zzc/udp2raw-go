@@ -1,6 +1,7 @@
 package tunnel
 
 import (
+	"crypto/cipher"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	cfgpkg "udp2raw-go/internal/config"
@@ -29,7 +31,8 @@ type Session struct {
 	auth     cryptopkg.AuthMode
 	sendSeq  uint64
 	replay   *AntiReplay
-	sendLock sync.Mutex
+	encBlock cipher.Block
+	decBlock cipher.Block
 }
 
 func NewSession(secret string, isClient bool, cipherMode string, authMode string) (*Session, error) {
@@ -37,12 +40,22 @@ func NewSession(secret string, isClient bool, cipherMode string, authMode string
 	if err != nil {
 		return nil, err
 	}
+	encBlock, err := cryptopkg.PrepareBlock(enc, cryptopkg.CipherMode(cipherMode))
+	if err != nil {
+		return nil, err
+	}
+	decBlock, err := cryptopkg.PrepareBlock(dec, cryptopkg.CipherMode(cipherMode))
+	if err != nil {
+		return nil, err
+	}
 	return &Session{
-		encKeys: enc,
-		decKeys: dec,
-		cipher:  cryptopkg.CipherMode(cipherMode),
-		auth:    cryptopkg.AuthMode(authMode),
-		replay:  NewAntiReplay(64),
+		encKeys:  enc,
+		decKeys:  dec,
+		cipher:   cryptopkg.CipherMode(cipherMode),
+		auth:     cryptopkg.AuthMode(authMode),
+		replay:   NewAntiReplay(64),
+		encBlock: encBlock,
+		decBlock: decBlock,
 	}, nil
 }
 
@@ -55,10 +68,7 @@ type Frame struct {
 }
 
 func (s *Session) MarshalFrame(f Frame) ([]byte, error) {
-	s.sendLock.Lock()
-	s.sendSeq++
-	seq := s.sendSeq
-	s.sendLock.Unlock()
+	seq := atomic.AddUint64(&s.sendSeq, 1)
 
 	header := make([]byte, 4+1+8+4+1+2)
 	binary.BigEndian.PutUint32(header[0:4], magic)
@@ -71,12 +81,12 @@ func (s *Session) MarshalFrame(f Frame) ([]byte, error) {
 	}
 	binary.BigEndian.PutUint16(header[18:20], uint16(len(f.Payload)))
 	plain := append(header, f.Payload...)
-	return cryptopkg.Encrypt(plain, s.encKeys, s.cipher, s.auth)
+	return cryptopkg.EncryptWithBlock(plain, s.encKeys, s.cipher, s.auth, s.encBlock)
 }
 
 func (s *Session) UnmarshalFrame(b []byte) (Frame, error) {
 	var frame Frame
-	plain, err := cryptopkg.Decrypt(b, s.decKeys, s.cipher, s.auth)
+	plain, err := cryptopkg.DecryptWithBlock(b, s.decKeys, s.cipher, s.auth, s.decBlock)
 	if err != nil {
 		return frame, err
 	}
