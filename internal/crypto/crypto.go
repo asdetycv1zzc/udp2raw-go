@@ -17,6 +17,17 @@ import (
 	"golang.org/x/crypto/pbkdf2"
 )
 
+// PrepareBlock returns a cipher.Block when the chosen mode requires AES.
+// It returns nil for modes that don't use AES.
+func PrepareBlock(keys *Keys, cipherMode CipherMode) (cipher.Block, error) {
+	switch cipherMode {
+	case CipherAES128CBC, CipherAES128CFB:
+		return aes.NewCipher(keys.CipherKey)
+	default:
+		return nil, nil
+	}
+}
+
 // AuthMode describes integrity strategy.
 type AuthMode string
 
@@ -101,6 +112,15 @@ func expand(base []byte, info []byte, n int) ([]byte, error) {
 
 // Encrypt applies cipher and auth according to selected modes.
 func Encrypt(plain []byte, encKeys *Keys, cipherMode CipherMode, authMode AuthMode) ([]byte, error) {
+	return encryptWithBlock(plain, encKeys, cipherMode, authMode, nil)
+}
+
+// EncryptWithBlock reuses the provided AES block (when applicable) to avoid per-call allocations.
+func EncryptWithBlock(plain []byte, encKeys *Keys, cipherMode CipherMode, authMode AuthMode, block cipher.Block) ([]byte, error) {
+	return encryptWithBlock(plain, encKeys, cipherMode, authMode, block)
+}
+
+func encryptWithBlock(plain []byte, encKeys *Keys, cipherMode CipherMode, authMode AuthMode, block cipher.Block) ([]byte, error) {
 	var body []byte
 	switch cipherMode {
 	case CipherNone:
@@ -109,23 +129,23 @@ func Encrypt(plain []byte, encKeys *Keys, cipherMode CipherMode, authMode AuthMo
 		body = applyXOR(plain, encKeys.XorPad)
 	case CipherAES128CFB:
 		iv := randomIV(aes.BlockSize)
-		block, err := aes.NewCipher(encKeys.CipherKey)
+		cipherBlock, err := selectBlock(encKeys, block)
 		if err != nil {
 			return nil, err
 		}
-		stream := cipher.NewCFBEncrypter(block, iv)
+		stream := cipher.NewCFBEncrypter(cipherBlock, iv)
 		buf := make([]byte, len(plain))
 		stream.XORKeyStream(buf, plain)
 		body = append(iv, buf...)
 	case CipherAES128CBC:
 		iv := randomIV(aes.BlockSize)
-		block, err := aes.NewCipher(encKeys.CipherKey)
+		cipherBlock, err := selectBlock(encKeys, block)
 		if err != nil {
 			return nil, err
 		}
-		padded := pkcs7Pad(plain, block.BlockSize())
+		padded := pkcs7Pad(plain, cipherBlock.BlockSize())
 		buf := make([]byte, len(padded))
-		cipher.NewCBCEncrypter(block, iv).CryptBlocks(buf, padded)
+		cipher.NewCBCEncrypter(cipherBlock, iv).CryptBlocks(buf, padded)
 		body = append(iv, buf...)
 	default:
 		return nil, fmt.Errorf("unsupported cipher mode %s", cipherMode)
@@ -158,6 +178,15 @@ func Encrypt(plain []byte, encKeys *Keys, cipherMode CipherMode, authMode AuthMo
 
 // Decrypt reverses Encrypt and validates integrity.
 func Decrypt(ciphertext []byte, decKeys *Keys, cipherMode CipherMode, authMode AuthMode) ([]byte, error) {
+	return decryptWithBlock(ciphertext, decKeys, cipherMode, authMode, nil)
+}
+
+// DecryptWithBlock mirrors EncryptWithBlock, allowing callers to reuse AES blocks.
+func DecryptWithBlock(ciphertext []byte, decKeys *Keys, cipherMode CipherMode, authMode AuthMode, block cipher.Block) ([]byte, error) {
+	return decryptWithBlock(ciphertext, decKeys, cipherMode, authMode, block)
+}
+
+func decryptWithBlock(ciphertext []byte, decKeys *Keys, cipherMode CipherMode, authMode AuthMode, block cipher.Block) ([]byte, error) {
 	var body []byte
 	var err error
 
@@ -224,11 +253,11 @@ func Decrypt(ciphertext []byte, decKeys *Keys, cipherMode CipherMode, authMode A
 			return nil, errors.New("ciphertext too small for iv")
 		}
 		iv := body[:aes.BlockSize]
-		block, err := aes.NewCipher(decKeys.CipherKey)
+		cipherBlock, err := selectBlock(decKeys, block)
 		if err != nil {
 			return nil, err
 		}
-		stream := cipher.NewCFBDecrypter(block, iv)
+		stream := cipher.NewCFBDecrypter(cipherBlock, iv)
 		plain := make([]byte, len(body)-aes.BlockSize)
 		stream.XORKeyStream(plain, body[aes.BlockSize:])
 		return plain, nil
@@ -237,16 +266,16 @@ func Decrypt(ciphertext []byte, decKeys *Keys, cipherMode CipherMode, authMode A
 			return nil, errors.New("ciphertext too small for iv")
 		}
 		iv := body[:aes.BlockSize]
-		block, err := aes.NewCipher(decKeys.CipherKey)
+		cipherBlock, err := selectBlock(decKeys, block)
 		if err != nil {
 			return nil, err
 		}
-		if (len(body)-aes.BlockSize)%block.BlockSize() != 0 {
+		if (len(body)-aes.BlockSize)%cipherBlock.BlockSize() != 0 {
 			return nil, errors.New("ciphertext not full blocks")
 		}
 		buf := make([]byte, len(body)-aes.BlockSize)
-		cipher.NewCBCDecrypter(block, iv).CryptBlocks(buf, body[aes.BlockSize:])
-		plain, err := pkcs7Unpad(buf, block.BlockSize())
+		cipher.NewCBCDecrypter(cipherBlock, iv).CryptBlocks(buf, body[aes.BlockSize:])
+		plain, err := pkcs7Unpad(buf, cipherBlock.BlockSize())
 		if err != nil {
 			return nil, err
 		}
@@ -254,6 +283,13 @@ func Decrypt(ciphertext []byte, decKeys *Keys, cipherMode CipherMode, authMode A
 	default:
 		return nil, fmt.Errorf("unsupported cipher mode %s", cipherMode)
 	}
+}
+
+func selectBlock(keys *Keys, prepared cipher.Block) (cipher.Block, error) {
+	if prepared != nil {
+		return prepared, nil
+	}
+	return aes.NewCipher(keys.CipherKey)
 }
 
 func pkcs7Pad(data []byte, bs int) []byte {
