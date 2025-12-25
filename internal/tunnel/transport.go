@@ -72,9 +72,15 @@ func ioReadFull(conn net.Conn, buf []byte) (int, error) {
 
 type udpTransport struct{ conn *net.UDPConn }
 
-func (t *udpTransport) WriteTo(b []byte, addr net.Addr) (int, error) { return t.conn.WriteTo(b, addr) }
-func (t *udpTransport) ReadFrom(b []byte) (int, net.Addr, error)     { return t.conn.ReadFrom(b) }
-func (t *udpTransport) Close() error                                 { return t.conn.Close() }
+func (t *udpTransport) WriteTo(b []byte, addr net.Addr) (int, error) {
+	if t.conn.RemoteAddr() != nil {
+		// Use Write on connected sockets to avoid Go's WriteTo restriction.
+		return t.conn.Write(b)
+	}
+	return t.conn.WriteTo(b, addr)
+}
+func (t *udpTransport) ReadFrom(b []byte) (int, net.Addr, error) { return t.conn.ReadFrom(b) }
+func (t *udpTransport) Close() error                             { return t.conn.Close() }
 
 type icmpTransport struct {
 	conn   *icmp.PacketConn
